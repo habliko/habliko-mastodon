@@ -30,8 +30,28 @@ import urllib.error
 # CONFIG
 # ----------------------------------------------------------------------------
 
-GROQ_MODEL = "openai/gpt-oss-120b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ----------------------------------------------------------------------------
+# PROVEEDORES DE IA (Cerebras principal + Groq respaldo; ambos gpt-oss-120b).
+#   Cerebras: ~1.000.000 tokens/dia gratis | Groq: ~200.000 tokens/dia gratis
+# ----------------------------------------------------------------------------
+PROVIDERS = [
+    {
+        "name": "cerebras",
+        "url": "https://api.cerebras.ai/v1/chat/completions",
+        "key_env": "CEREBRAS_API_KEY",
+        "model": "gpt-oss-120b",
+        "max_tokens": 2000,
+        "reasoning_effort": "low",
+    },
+    {
+        "name": "groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key_env": "GROQ_API_KEY",
+        "model": "openai/gpt-oss-120b",
+        "max_tokens": 2000,
+        "reasoning_effort": "low",
+    },
+]
 USER_AGENT = "habliko-publisher/1.0"
 
 # >>> PON AQUI TU INSTANCIA DE MASTODON (sin barra final) <<<
@@ -231,6 +251,48 @@ def _parse_json_lenient(content):
 # ----------------------------------------------------------------------------
 
 
+def _provider_request(provider, system, user):
+    payload = {
+        "model": provider["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.85,
+        "max_tokens": provider.get("max_tokens", 2000),
+        "response_format": {"type": "json_object"},
+    }
+    if provider.get("reasoning_effort"):
+        payload["reasoning_effort"] = provider["reasoning_effort"]
+    headers = {"Authorization": "Bearer " + os.environ[provider["key_env"]]}
+    resp = _post_json(provider["url"], payload, headers)
+    return (resp["choices"][0]["message"]["content"] or "").strip()
+
+
+def _multi_generate(system, user):
+    active = [p for p in PROVIDERS if os.environ.get(p["key_env"])]
+    if not active:
+        raise RuntimeError("Ningun proveedor tiene API key (CEREBRAS/GROQ)")
+    last = None
+    for p in active:
+        try:
+            content = _provider_request(p, system, user)
+            if p is not active[0]:
+                print("   (respaldo: %s)" % p["name"])
+            return content
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("   %s dio 429; pruebo el siguiente..." % p["name"])
+                last = e
+                continue
+            last = e
+            break
+        except Exception as e:
+            last = e
+            break
+    raise last or RuntimeError("Fallo la generacion en todos los proveedores")
+
+
 def groq_short(lang, theme):
     lang_name = LANG_NAMES[lang]
     system = (
@@ -250,23 +312,10 @@ def groq_short(lang, theme):
         "- hashtags: 2-3 relevant tags (language learning). Short."
     ).format(lang_name=lang_name, theme=theme)
 
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.85,
-        "max_tokens": 2000,
-        "reasoning_effort": "low",
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": "Bearer " + os.environ["GROQ_API_KEY"]}
-    resp = _post_json(GROQ_URL, payload, headers)
-    content = (resp["choices"][0]["message"]["content"] or "").strip()
+    content = _multi_generate(system, user)
     art = _parse_json_lenient(content)
     if not art.get("text"):
-        raise ValueError("Groq no devolvio 'text'")
+        raise ValueError("El proveedor no devolvio 'text'")
     if not isinstance(art.get("hashtags"), list):
         art["hashtags"] = []
     return art
@@ -391,7 +440,7 @@ def publish_one(lang, progress):
     print("Idioma %s (%s) | Tema #%d: %s"
           % (lang, LANG_NAMES[lang], topic["num"], topic["theme"]))
 
-    art = groq_short_retry(lang, topic["theme"])
+    art = groq_short(lang, topic["theme"])
 
     media_id = None
     got = fetch_image_bytes(lang)
@@ -410,11 +459,15 @@ def publish_one(lang, progress):
 
 
 def main():
-    missing = [v for v in ("GROQ_API_KEY", "MASTODON_TOKEN")
-               if not os.environ.get(v)]
-    if missing:
-        print("ERROR: faltan secrets: %s" % ", ".join(missing))
+    if not os.environ.get("MASTODON_TOKEN"):
+        print("ERROR: falta secret MASTODON_TOKEN")
         sys.exit(1)
+    active = [p["name"] for p in PROVIDERS if os.environ.get(p["key_env"])]
+    if not active:
+        print("ERROR: falta al menos una API key de IA "
+              "(CEREBRAS_API_KEY y/o GROQ_API_KEY)")
+        sys.exit(1)
+    print("Proveedores IA (en orden): %s" % ", ".join(active))
     if "TU_INSTANCIA" in MASTODON_INSTANCE or not MASTODON_INSTANCE.startswith("http"):
         print("ERROR: configura MASTODON_INSTANCE con tu instancia real.")
         sys.exit(1)
